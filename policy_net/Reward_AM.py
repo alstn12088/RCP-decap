@@ -6,7 +6,7 @@ import math
 from typing import NamedTuple
 from policy_net.graph_encoder import GraphAttentionEncoder
 from simulator.decap_sim import decap_sim
-
+from policy_net.state import StateDecap
 
 
 
@@ -158,6 +158,9 @@ class AttentionModel(nn.Module):
         # Note n_heads * val_dim == embedding_dim so input to project_out is embedding_dim
         self.project_out = nn.Linear(embedding_dim, embedding_dim, bias=False)
 
+
+
+
     def set_decode_type(self, decode_type, temp=None):
         self.decode_type = decode_type
         if temp is not None:  # Do not change temperature if not provided
@@ -174,8 +177,7 @@ class AttentionModel(nn.Module):
         self.probing_point = torch.where(input[:,:,2]==2)[1].clone().view(-1,1)
         self.probing = input[:,:,2]==2
         self.keep_out = input[:,:,2]==1
-        
-      
+  
 
 
         embeddings, _ = self.embedder(self._init_embed(input))
@@ -184,10 +186,6 @@ class AttentionModel(nn.Module):
 
         if action==None:
 
-            if return_pi:
-                cost = 0
-                ll = self._calc_log_likelihood(_log_p, pi, None)
-            else:
                 cost, mask = self.get_costs(input, pi)
                 ll = self._calc_log_likelihood(_log_p, pi, mask)
             
@@ -200,17 +198,17 @@ class AttentionModel(nn.Module):
         # DataParallel since sequences can be of different lengths
         # ll = self._calc_log_likelihood(_log_p, pi, mask)
         if return_pi:
-            return cost, ll, pi
+            return cost, pi
         # np.save('PGRL_IL_solution_R', pi.cpu().numpy())
         # np.save('PGRL_IL_rewards_R', cost.cpu().numpy()) 
         return cost, ll
 
-    def get_costs(dataset,pi):
+    def get_costs(self,dataset,pi):
         reward_list = []
         for i in range(pi.size(0)):
 
 
-            reward = decap_sim(problem = (dataset[i,:,2]==2).nonzero().item(), solution = pi[i].cpu().numpy().tolist())
+            reward = decap_sim(probe = (dataset[i,:,2]==2).nonzero().item(), solution = pi[i].cpu().numpy().tolist())
           
             reward_list.append(reward)
         reward = torch.FloatTensor(reward_list).cuda().view(-1,1)
@@ -228,6 +226,7 @@ class AttentionModel(nn.Module):
     def _calc_log_likelihood(self, _log_p, a, mask):
 
         # Get log_p corresponding to selected actions
+
         log_p = _log_p.gather(2, a.unsqueeze(-1)).squeeze(-1)
 
         # Optional: mask out actions irrelevant to objective so they do not get reinforced
@@ -243,6 +242,10 @@ class AttentionModel(nn.Module):
 
         return self.init_embed(input)
 
+    def make_state(*args, **kwargs):
+        return StateDecap.initialize(*args, **kwargs)
+    
+
     def _inner(self, input,reward_query, embeddings,action=None, probing=None, keep_out=None):
 
         # in the case that only inner is called by eval.py function
@@ -257,7 +260,7 @@ class AttentionModel(nn.Module):
         outputs = []
         sequences = []
 
-        state = self.make_state(input)
+        state = StateDecap.initialize(input)
 
         # Compute keys, values for the glimpse and keys for the logits once as they can be reused in every step
         fixed = self._precompute(embeddings,reward_query)
@@ -309,29 +312,29 @@ class AttentionModel(nn.Module):
 
         assert (probs == probs).all(), "Probs should not contain any nans"
 
-        if self.decode_type == "greedy":
-            _, selected = probs.max(1)
-            assert not mask.gather(1, selected.unsqueeze(
-                -1)).data.any(), "Decode greedy: infeasible action has maximum probability"
+        # if self.decode_type == "greedy":
+        #     _, selected = probs.max(1)
+        #     assert not mask.gather(1, selected.unsqueeze(
+        #         -1)).data.any(), "Decode greedy: infeasible action has maximum probability"
 
-        elif self.decode_type == "sampling":
+        #elif self.decode_type == "sampling":
+        selected = probs.multinomial(1).squeeze(1)
+
+        # Check if sampling went OK, can go wrong due to bug on GPU
+        # See https://discuss.pytorch.org/t/bad-behavior-of-multinomial-function/10232
+        while mask.gather(1, selected.unsqueeze(-1)).data.any():
+            print('Sampled bad values, resampling!')
             selected = probs.multinomial(1).squeeze(1)
 
-            # Check if sampling went OK, can go wrong due to bug on GPU
-            # See https://discuss.pytorch.org/t/bad-behavior-of-multinomial-function/10232
-            while mask.gather(1, selected.unsqueeze(-1)).data.any():
-                print('Sampled bad values, resampling!')
-                selected = probs.multinomial(1).squeeze(1)
-
-        else:
-            assert False, "Unknown decode type"
         return selected
 
     def _precompute(self, embeddings,reward_query, num_steps=1):
 
         # The fixed context projection of the graph embedding is calculated only once for efficiency
         graph_embed = embeddings.mean(1)
+        
         graph_embed += self.cond_embedding(reward_query)
+
         # fixed context = (batch_size, 1, embed_dim) to make broadcastable with parallel timesteps
         fixed_context = self.project_fixed_context(graph_embed)[:, None, :]
 
@@ -347,18 +350,7 @@ class AttentionModel(nn.Module):
         )
         return AttentionModelFixed(embeddings, fixed_context, *fixed_attention_node_data)
 
-    def _get_log_p_topk(self, fixed, state, k=None, normalize=True):
-        log_p, _ = self._get_log_p(fixed, state, normalize=normalize)
 
-        # Return topk
-        if k is not None and k < log_p.size(-1):
-            return log_p.topk(k, -1)
-
-        # Return all, note different from torch.topk this does not give error if less than k elements along dim
-        return (
-            log_p,
-            torch.arange(log_p.size(-1), device=log_p.device, dtype=torch.int64).repeat(log_p.size(0), 1)[:, None, :]
-        )
 
     def _get_log_p(self, fixed, state, probing=None, keep_out=None,normalize=True):
 
@@ -383,9 +375,9 @@ class AttentionModel(nn.Module):
         # Compute logits (unnormalized log_p)
         log_p, glimpse = self._one_to_many_logits(query, glimpse_K, glimpse_V, logit_K, mask)
 
-        if normalize:
-            log_p = torch.log_softmax(log_p / self.temp, dim=-1)
 
+        log_p = torch.clip(torch.log_softmax(log_p / self.temp, dim=-1),min=-10)
+        
         assert not torch.isnan(log_p).any()
 
         return log_p, mask
